@@ -1,3 +1,102 @@
+import argparse
+import asyncio
+import concurrent.futures
+import gc
+import logging
+import os
+import sys
+import zipfile
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple, Generator
+
+import psutil
+from lxml import etree
+import networkx as nx
+from fastkml import kml
+from shapely.geometry import Point
+from memory_profiler import profile
+from neo4j import AsyncGraphDatabase
+
+# PyTorch e PyG
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+
+# Função para obter placemarks contendo Point, MultiPoint ou LineString usando lxml
+def get_all_placemarks_from_kml(xml_bytes):
+    nsmap = {
+        'kml': 'http://www.opengis.net/kml/2.2',
+        'gx': 'http://www.google.com/kml/ext/2.2'
+    }
+    root = etree.fromstring(xml_bytes)
+    placemarks_data = []
+
+    def get_folder_path(element):
+        path = []
+        parent = element.getparent()
+        while parent is not None:
+            if parent.tag.endswith('Folder') or parent.tag.endswith('Document'):
+                name_elem = parent.find('kml:name', namespaces=nsmap)
+                if name_elem is not None and name_elem.text:
+                    path.insert(0, name_elem.text)
+            parent = parent.getparent()
+        return path
+
+    for pm in root.xpath('.//kml:Placemark', namespaces=nsmap):
+        name_elem = pm.find('kml:name', namespaces=nsmap)
+        name = name_elem.text if name_elem is not None else ""
+        desc_elem = pm.find('kml:description', namespaces=nsmap)
+        description = desc_elem.text if desc_elem is not None else ""
+        folder_path = get_folder_path(pm)
+
+        geom_type = None
+        coords_text = None
+
+        # Check for Point
+        point = pm.find('.//kml:Point', namespaces=nsmap)
+        if point is not None:
+            geom_type = "Point"
+            coords_elem = point.find('kml:coordinates', namespaces=nsmap)
+            if coords_elem is not None and coords_elem.text:
+                coords_text = coords_elem.text.strip()
+        else:
+            multipoint = pm.find('.//kml:MultiGeometry', namespaces=nsmap)
+            if multipoint is not None:
+                # Check if MultiGeometry contains multiple Points
+                points = multipoint.findall('kml:Point', namespaces=nsmap)
+                if points and len(points) > 1:
+                    geom_type = "MultiPoint"
+                    coords_list = []
+                    for pt in points:
+                        coords_elem = pt.find('kml:coordinates', namespaces=nsmap)
+                        if coords_elem is not None and coords_elem.text:
+                            coords_list.append(coords_elem.text.strip())
+                    coords_text = ";".join(coords_list)
+                else:
+                    # Could be other geometries inside MultiGeometry, check for LineString
+                    linestring = multipoint.find('kml:LineString', namespaces=nsmap)
+                    if linestring is not None:
+                        geom_type = "LineString"
+                        coords_elem = linestring.find('kml:coordinates', namespaces=nsmap)
+                        if coords_elem is not None and coords_elem.text:
+                            coords_text = coords_elem.text.strip()
+            else:
+                # Check for LineString directly
+                linestring = pm.find('.//kml:LineString', namespaces=nsmap)
+                if linestring is not None:
+                    geom_type = "LineString"
+                    coords_elem = linestring.find('kml:coordinates', namespaces=nsmap)
+                    if coords_elem is not None and coords_elem.text:
+                        coords_text = coords_elem.text.strip()
+
+        if geom_type and coords_text:
+            placemarks_data.append((name, geom_type, coords_text, folder_path, description))
+
+    return placemarks_data
 import networkx as nx
 import asyncio
 from neo4j import AsyncGraphDatabase
@@ -18,12 +117,62 @@ import xml.etree.ElementTree as ET
 from functools import partial
 from memory_profiler import profile
 
+
+def process_kml_chunk(chunk: bytes):
+    """
+    Processa um chunk de KML extraindo ONUs (Placemarks com Point).
+    Retorna uma lista de dicionários: {id, coords, type, description}
+    """
+    results = []
+    try:
+        # Parse o XML do chunk
+        root = ET.fromstring(chunk)
+        # Namespaces comuns em KML
+        ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+        # Busca todos os Placemarks
+        for placemark in root.findall('.//kml:Placemark', ns):
+            # Tenta extrair o nome/id
+            name_elem = placemark.find('kml:name', ns)
+            node_id = name_elem.text.strip() if name_elem is not None else None
+            # Tenta extrair a descrição
+            desc_elem = placemark.find('kml:description', ns)
+            description = desc_elem.text.strip() if desc_elem is not None else ''
+            # Tenta extrair coordenadas de Point
+            point_elem = placemark.find('.//kml:Point', ns)
+            coords = None
+            if point_elem is not None:
+                coord_elem = point_elem.find('kml:coordinates', ns)
+                if coord_elem is not None and coord_elem.text:
+                    coord_text = coord_elem.text.strip()
+                    # KML: lon,lat[,alt]
+                    parts = coord_text.split(',')
+                    if len(parts) >= 2:
+                        try:
+                            lon = float(parts[0])
+                            lat = float(parts[1])
+                            coords = (lat, lon)
+                        except Exception:
+                            coords = None
+            # Só adiciona se tiver id e coordenadas
+            if node_id and coords:
+                results.append({
+                    'id': node_id,
+                    'coords': coords,
+                    'type': 'ONU',
+                    'description': description
+                })
+    except Exception as e:
+        # Loga erro, mas não interrompe processamento dos outros chunks
+        import logging
+        logging.getLogger(__name__).warning(f"Erro ao processar chunk de KML: {e}")
+    return results
+
 def setup_logging():
     """Configure optimized logging with file and console output."""
     log_filename = f"gnn_processing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
     handlers = [
-        logging.FileHandler(log_filename, buffering=1024),
+        logging.FileHandler(log_filename),
         logging.StreamHandler(sys.stdout)
     ]
     
@@ -231,7 +380,7 @@ class AsyncNeo4jGraph:
             max_connection_pool_size=50,
             connection_acquisition_timeout=30
         )
-        self.batch_size = 5000  # Increased batch size for better performance
+        self.batch_size = 10000  # Increased batch size for better performance
         self.monitor = ResourceMonitor()
         
     def stream_data(self, data: List, batch_size: int = None) -> Generator:
@@ -266,6 +415,7 @@ class AsyncNeo4jGraph:
         """Create indexes for better query performance."""
         async with self.driver.session() as session:
             try:
+                
                 # Create index for node ID
                 await session.run("CREATE INDEX node_id IF NOT EXISTS FOR (n:Node) ON (n.id)")
                 # Create index for node type
@@ -283,10 +433,12 @@ class AsyncNeo4jGraph:
             nodes_data: List of node dictionaries with properties
         """
         query = """
-        USING PERIODIC COMMIT 1000
-        UNWIND $batch AS node
-        CREATE (n:Node)
-        SET n = node
+        CALL {
+            WITH $batch AS batch
+            UNWIND batch AS node
+            CREATE (n:Node)
+            SET n = node
+        } IN TRANSACTIONS OF 1000 ROWS
         """
         
         total_nodes = len(nodes_data)
@@ -317,14 +469,14 @@ class AsyncNeo4jGraph:
         """
         # Optimized query using PERIODIC COMMIT and efficient index usage
         query = """
-        USING PERIODIC COMMIT 1000
-        UNWIND $batch AS edge
-        MATCH (source:Node {id: edge.source_id})
-        USING INDEX source:Node(id)
-        MATCH (target:Node {id: edge.target_id})
-        USING INDEX target:Node(id)
-        CREATE (source)-[r:CONNECTS_TO]->(target)
-        SET r = edge.properties
+        CALL {
+            WITH $batch AS batch
+            UNWIND batch AS edge
+            MATCH (source:Node {id: edge.source_id})
+            MATCH (target:Node {id: edge.target_id})
+            CREATE (source)-[r:CONNECTS_TO]->(target)
+            SET r = edge.properties
+        } IN TRANSACTIONS OF 1000 ROWS
         """
         
         total_edges = len(edges_data)
@@ -443,9 +595,9 @@ async def export_graph_to_neo4j(G: nx.Graph, neo4j_config: Dict[str, str]):
     try:
         await export_to_neo4j(
             G,
-            uri=neo4j_config.get("uri", "neo4j://localhost:7687"),
+            uri=neo4j_config.get("uri", "bolt://localhost:7687"),
             username=neo4j_config.get("username", "neo4j"),
-            password=neo4j_config.get("password", "your_password")
+            password=neo4j_config.get("password", "neo4j")
         )
     except Exception as e:
         logger.error(f"Failed to export to Neo4j: {str(e)}")
@@ -454,36 +606,81 @@ async def export_graph_to_neo4j(G: nx.Graph, neo4j_config: Dict[str, str]):
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Process network topology file and export to Neo4j')
-    
+
+    env_input = os.environ.get('INPUT_FILE')
+
     parser.add_argument(
         '--input', '-i',
         type=str,
-        help='Input file path (KML or KMZ)',
-        required=True
+        help='Input file path (KML ou KMZ). Pode ser definido pela variável de ambiente INPUT_FILE.',
+        required=(env_input is None)
     )
-    
+
     parser.add_argument(
         '--neo4j-uri',
         type=str,
-        default='neo4j://localhost:7687',
-        help='Neo4j database URI (default: neo4j://localhost:7687)'
+        default='bolt://localhost:7687',
+        help='Neo4j database URI (default: bolt://localhost:7687)'
     )
-    
+
     parser.add_argument(
         '--neo4j-user',
         type=str,
         default='neo4j',
         help='Neo4j username (default: neo4j)'
     )
-    
+
     parser.add_argument(
         '--neo4j-password',
         type=str,
-        required=True,
-        help='Neo4j password'
+        default='gnnneutra',
+        help='Neo4j password (default: neo4j)'
     )
-    
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    if getattr(args, 'input', None) is None and env_input is not None:
+        args.input = env_input
+    return args
+
+import torch
+from torch_geometric.data import Data
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import torch.nn as nn
+
+def nx_to_pyg(G: nx.Graph):
+    node_map = {n: i for i, n in enumerate(G.nodes())}
+    edge_index = []
+    for u, v in G.edges():
+        edge_index.append([node_map[u], node_map[v]])
+    if not edge_index:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    else:
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    # Features dummy (pode ser ajustado para atributos reais)
+    x = torch.ones((G.number_of_nodes(), 1), dtype=torch.float)
+    return Data(x=x, edge_index=edge_index)
+
+class SimpleGNN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        return x
+
+class EdgeClassifier(nn.Module):
+    def __init__(self, emb_dim, num_classes):
+        super().__init__()
+        self.fc = nn.Linear(emb_dim * 2, num_classes)
+    def forward(self, emb_u, emb_v):
+        x = torch.cat([emb_u, emb_v], dim=-1)
+        return self.fc(x)
 
 async def main():
     """Main execution function with optimized resource usage."""
@@ -493,89 +690,153 @@ async def main():
     try:
         # Parse arguments
         args = parse_arguments()
-        
         # Validate input file
         if not validate_file(args.input):
             return
-        
-        # Log initial resource usage
         monitor.log_usage()
+
+        # --- 1. Ler arquivo ---
+        xml_data = load_kml_content(args.input)
+        logger.info("Successfully loaded KML content")
+        monitor.log_usage()
+
+        # --- 2. Extrair placemarks ---
+        placemarks = get_all_placemarks_from_kml(xml_data)
+
+        # --- 3. Criar grafo ---
+        G = nx.Graph()
+        node_to_folder = {}
+
+        def get_node_id_for_point(point, base_name="pt"):
+            return f"{base_name}_{point.x:.6f}_{point.y:.6f}"
+
+        for nome, tipo, coords_str, folder_path, descricao in placemarks:
+            if tipo == "Point":
+                parts = coords_str.split(',')
+                if len(parts) >= 2:
+                    x, y = float(parts[0]), float(parts[1])
+                    coords = (x, y)
+                    node_id = nome if nome else get_node_id_for_point(Point(x, y), "node")
+                    G.add_node(node_id, coords=coords, description=descricao)
+                    node_to_folder[node_id] = folder_path
+            elif tipo == "MultiPoint":
+                points_str = coords_str.split(';')
+                for idx, pt_str in enumerate(points_str):
+                    parts = pt_str.split(',')
+                    if len(parts) >= 2:
+                        x, y = float(parts[0]), float(parts[1])
+                        coords = (x, y)
+                        node_id = f"{nome}_{idx}" if nome else get_node_id_for_point(Point(x, y), f"multipoint_{idx}")
+                        G.add_node(node_id, coords=coords, description=descricao)
+                        node_to_folder[node_id] = folder_path
+            elif tipo == "LineString":
+                coords_list = []
+                coord_pairs = coords_str.split()
+                for c in coord_pairs:
+                    parts = c.split(',')
+                    if len(parts) >= 2:
+                        x, y = float(parts[0]), float(parts[1])
+                        coords_list.append((x, y))
+                node_ids = []
+                for idx, coord in enumerate(coords_list):
+                    if nome:
+                        node_id = f"{nome}_{idx}"
+                    else:
+                        node_id = get_node_id_for_point(Point(coord), f"linestring_{idx}")
+                    if node_id not in G:
+                        G.add_node(node_id, coords=coord, description=descricao)
+                        node_to_folder[node_id] = folder_path
+                    node_ids.append(node_id)
+                for i in range(len(node_ids) - 1):
+                    G.add_edge(node_ids[i], node_ids[i+1], fibra="SMF")
+
+        # Garantir OLT
+        if "OLT" not in G:
+            G.add_node("OLT", coords=(0.0, 0.0), description="OLT padrão")
+            node_to_folder["OLT"] = ["OLT"]
+
+        # Exemplo de ligação: ONU -> OLT
+        for n in list(G.nodes()):
+            if n.startswith("ONU"):
+                G.add_edge("OLT", n, fibra="SMF")
+
+        # Atualizar status
+        def update_node_status(n):
+            if n.startswith("ONU"):
+                G.nodes[n]["status"] = "ativo"
+            if n.startswith("OLT"):
+                G.nodes[n]["status"] = "ativo"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(update_node_status, n) for n in G.nodes()]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        logger.info(f"Created graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+
+        # Exportar para Neo4j
+        neo4j_config = {
+            "uri": args.neo4j_uri,
+            "username": args.neo4j_user,
+            "password": args.neo4j_password
+        }
+        await export_graph_to_neo4j(G, neo4j_config)
+        logger.info("Successfully exported graph to Neo4j")
+        monitor.log_usage()
+        duration = datetime.now() - start_time
+        logger.info(f"Total processing time: {duration}")
         
-        try:
-            # Create network builder
-            builder = NetworkBuilder()
-            logger.info("Created NetworkBuilder instance")
-            
-            # Load and process file in chunks
-            xml_data = load_kml_content(args.input)
-            logger.info("Successfully loaded KML content")
-            monitor.log_usage()
-            
-            # Process XML in parallel chunks
-            chunks = split_xml_content(xml_data)
-            logger.info(f"Split content into {len(chunks)} chunks for processing")
-            
-            with concurrent.futures.ProcessPoolExecutor() as executor:
-                # Process chunks in parallel
-                futures = []
-                for i, chunk in enumerate(chunks):
-                    future = executor.submit(process_kml_chunk, chunk)
-                    futures.append(future)
-                
-                # Collect results
-                results = []
-                for future in concurrent.futures.as_completed(futures):
-                    results.extend(future.result())
-                    monitor.log_usage()
-            
-            # Create base OLT
-            builder.create_olt()
-            
-            # Build graph from processed results
-            for node_data in results:
-                if node_data['type'] == 'ONU':
-                    builder.create_onu(
-                        node_data['id'],
-                        node_data['coords'],
-                        node_data.get('description', '')
-                    )
-            
-            # Update status with optimized batch processing
-            builder.bulk_update_status()
-            logger.info("Updated node statuses")
-            monitor.log_usage()
-            
-            # Get the graph
-            G = builder.get_graph()
-            logger.info(f"Created graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-            
-            # Export to Neo4j with optimized settings
-            neo4j_config = {
-                "uri": args.neo4j_uri,
-                "username": args.neo4j_user,
-                "password": args.neo4j_password
-            }
-            
-            # Run the Neo4j export
-            await export_graph_to_neo4j(G, neo4j_config)
-            logger.info("Successfully exported graph to Neo4j")
-            
-            # Final resource usage and timing
-            monitor.log_usage()
-            duration = datetime.now() - start_time
-            logger.info(f"Total processing time: {duration}")
-            
-        finally:
-            # Clean up resources
-            monitor.clear_memory()
-            
-    except Exception as e:
-        logger.error(f"Error during execution: {str(e)}")
-        raise
-        
-    except Exception as e:
-        logger.error(f"Error during execution: {str(e)}")
-        raise
+        # --- INFERÊNCIA GNN NA GPU ---
+        pyg_data = nx_to_pyg(G)
+        pyg_data = pyg_data.to('cuda')
+
+        model = SimpleGNN(in_channels=1, hidden_channels=16, out_channels=8)
+        # Se você já treinou um modelo, carregue-o aqui:
+        # model.load_state_dict(torch.load('meu_modelo_gnn.pth'))
+        model = model.to('cuda')
+        model.eval()
+
+        with torch.no_grad():
+            node_embeddings = model(pyg_data)
+            print('Node embeddings (GNN, GPU):', node_embeddings)
+
+            # --- Link Prediction (previsão de novas conexões) ---
+            node_map = {n: i for i, n in enumerate(G.nodes())}
+            possible_pairs = [
+                (node_map[u], node_map[v])
+                for u in G.nodes() for v in G.nodes()
+                if u != v and not G.has_edge(u, v)
+            ]
+            def link_prediction_scores(node_embeddings, pairs):
+                scores = []
+                for u, v in pairs:
+                    score = (node_embeddings[u] * node_embeddings[v]).sum()
+                    scores.append(score.item())
+                return scores
+            if possible_pairs:
+                scores = link_prediction_scores(node_embeddings, possible_pairs)
+                top_indices = torch.topk(torch.tensor(scores), min(5, len(scores))).indices
+                for idx in top_indices:
+                    u_idx, v_idx = possible_pairs[idx]
+                    u = list(G.nodes())[u_idx]
+                    v = list(G.nodes())[v_idx]
+                    print(f"Sugerir nova conexão: {u} <-> {v} (score={scores[idx]:.4f})")
+
+            # --- Classificação de arestas ---
+            edge_classifier = EdgeClassifier(node_embeddings.shape[1], num_classes=3).to('cuda')
+            # Se você já treinou, descomente:
+            # edge_classifier.load_state_dict(torch.load('meu_edge_classifier.pth'))
+            edge_classifier.eval()
+            for u, v in G.edges():
+                u_idx = node_map[u]
+                v_idx = node_map[v]
+                emb_u = node_embeddings[u_idx].unsqueeze(0)
+                emb_v = node_embeddings[v_idx].unsqueeze(0)
+                logits = edge_classifier(emb_u, emb_v)
+                pred_class = logits.argmax(dim=1).item()
+                print(f"Aresta {u} <-> {v}: classe prevista = {pred_class}")
+    finally:
+        monitor.clear_memory()
 
 if __name__ == "__main__":
     asyncio.run(main())
